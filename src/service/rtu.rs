@@ -54,11 +54,13 @@ where
     }
 
     async fn call(&mut self, req: Request<'_>) -> Result<Response> {
-        log::debug!("Call {req:?}");
-
         let req_function_code = req.function_code();
         let req_adu = self.next_request_adu(req);
         let req_hdr = req_adu.hdr;
+
+        if matches!(req_function_code, FunctionCode::Custom(21)) {
+            log::error!("Request: {req_adu:x?}");
+        }
 
         let framed = self.framed()?;
 
@@ -69,6 +71,11 @@ where
             .next()
             .await
             .unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::BrokenPipe)))?;
+
+        if matches!(req_function_code, FunctionCode::Custom(21)) {
+            log::error!("Response: {res_adu:x?}");
+        }
+
         let ResponseAdu {
             hdr: res_hdr,
             pdu: res_pdu,
