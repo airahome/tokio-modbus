@@ -7,7 +7,7 @@ use std::{borrow::Cow, fmt::Debug, io};
 
 use async_trait::async_trait;
 
-use crate::{frame::*, slave::*, ProtocolError, Result};
+use crate::{frame::*, slave::*, Result};
 
 #[cfg(feature = "rtu")]
 pub mod rtu;
@@ -90,10 +90,14 @@ pub trait Writer: Client {
     /// Write file record (0x15)
     async fn write_file_record(
         &mut self,
-        data: &[u8; 128],
-        block: impl Into<u16> + std::marker::Copy + std::marker::Send,
-        device: u8,
+        data: &[u8],
+        record_number: u16,
+        file_number: u16,
     ) -> Result<()>;
+
+    /// Write empty file record (0x15)
+    async fn write_empty_file_record(&mut self, record_number: u16, file_number: u16)
+        -> Result<()>;
 }
 
 /// Asynchronous Modbus client context
@@ -325,84 +329,77 @@ impl Writer for Context {
 
     /// Write file record (0x15)
     ///
-    /// Note that this implementation is tailored for writing files to Jeff
-    /// modbus units. The Modbus specification accepts variable length data
-    /// transfers and states that the device should also echo the data.
-    ///
-    /// Decoding the response of this message is enabled by antoher Jeff specific
-    /// change in codec/rtu.rs
+    /// Decoding the response of this message is enabled by another
+    /// customization in codec/rtu.rs
     async fn write_file_record<'a>(
         &'a mut self,
-        data: &[u8; 128],
-        block: impl Into<u16> + std::marker::Copy + std::marker::Send,
-        device: u8,
+        data: &[u8],
+        record_number: u16,
+        file_number: u16,
     ) -> Result<()> {
-        fn header(device: u8, block: u16, length: u8) -> Vec<u8> {
-            let bytes = block.to_be_bytes();
-            let reference_type = 6;
-            let file_number_hi = 0;
-            let number_of_blocks_hi = 0;
-            let number_of_blocks_lo = 64;
-            vec![
-                length,
-                reference_type,
-                file_number_hi,
-                device,
-                bytes[0],
-                bytes[1],
-                number_of_blocks_hi,
-                number_of_blocks_lo,
-            ]
-        }
-
-        let mut message = header(device, block.into(), 135);
+        let mut message = Vec::new();
+        let request_data_length = 7 + data.len();
+        message.push(request_data_length as u8);
+        message.push(0x06); // Reference type
+        message.extend(file_number.to_be_bytes());
+        message.extend(record_number.to_be_bytes());
+        let record_length = data.len() as u16 / 2;
+        message.extend(record_length.to_be_bytes());
         message.extend(data);
 
         let request_function_code = FunctionCode::WriteFileRecord;
 
-        match self
-            .client
+        self.client
             .call(Request::Custom(
                 request_function_code.value(),
                 Cow::Borrowed(&message),
             ))
             .await
-        {
-            Ok(result) => match result {
-                Ok(response) => match response {
-                    Response::Custom(rsp_function_code, rsp_bytes) => {
-                        if request_function_code.value() != rsp_function_code {
-                            let result = Err(ExceptionResponse {
-                                function: request_function_code,
-                                exception: ExceptionCode::Custom(90),
-                            });
-                            let protocol_error = ProtocolError::FunctionCodeMismatch {
-                                request: request_function_code,
-                                result,
-                            };
-                            return Err(protocol_error.into());
-                        }
-
-                        if rsp_bytes != header(device, block.into(), 7) {
-                            let result = Err(ExceptionResponse {
-                                function: request_function_code,
-                                exception: ExceptionCode::Custom(91),
-                            });
-                            let protocol_error = ProtocolError::HeaderMismatch {
-                                message: "Invalid header data in response".to_owned(),
-                                result,
-                            };
-                            return Err(protocol_error.into());
-                        }
-
-                        Ok(Ok(()))
+            .map(|result| {
+                result.map(|response| match response {
+                    Response::Custom(_rsp_addr, _rsp_bytes) => {
+                        // Not sure what to verify here, other requests only have debug asserts.
                     }
                     _ => unreachable!("call() should reject mismatching responses"),
-                },
-                Err(exception_code) => Ok(Err(exception_code)),
-            },
-            Err(error) => Err(error),
-        }
+                })
+            })
+    }
+
+    /// Write empty file record (0x15)
+    ///
+    /// Decoding the response of this message is enabled by another
+    /// customization in codec/rtu.rs
+    ///
+    /// Function is required by the Carel board, added a function to not clutter
+    /// the CCV implementation
+    async fn write_empty_file_record<'a>(
+        &'a mut self,
+        record_number: u16,
+        file_number: u16,
+    ) -> Result<()> {
+        let mut message = Vec::new();
+        message.push(7); // Request data length
+        message.push(0x06); // Reference type
+        message.extend(file_number.to_be_bytes());
+        message.extend(record_number.to_be_bytes());
+        message.extend(vec![0, 0]); // Record length
+
+        let request_function_code = FunctionCode::WriteFileRecord;
+
+        self.client
+            .call(Request::Custom(
+                request_function_code.value(),
+                Cow::Borrowed(&message),
+            ))
+            .await
+            .map(|result| {
+                result.map(|response| match response {
+                    Response::Custom(_rsp_addr, _rsp_bytes) => {
+                        // Not sure what to verify here, other requests only have debug asserts.
+                    }
+                    _ => unreachable!("call() should reject mismatching responses"),
+                })
+            })
     }
 }
 
