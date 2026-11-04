@@ -156,6 +156,10 @@ fn get_request_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
     }
 }
 
+/// The length of a short file record ack: slave, function code, byte count
+/// and CRC.
+const SHORT_FILE_RECORD_ACK_LEN: usize = 5;
+
 fn get_response_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
     if let Some(fn_code) = adu_buf.get(1) {
         #[allow(clippy::match_same_arms)]
@@ -167,8 +171,29 @@ fn get_response_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
             }
             0x05 | 0x06 | 0x0B | 0x0F | 0x10 => 5,
             0x07 => 2,
-            // NOTE: For function file record, figure out the dynamic size depending on the message itself
-            0x15 => adu_buf.get(2).copied().unwrap_or(7) as usize + 2,
+            // A 0x15 reply comes in one of three shapes:
+            //   CCV                         slave, 0x15, 0x07, <7-byte header>, CRC
+            //   Carel IU up to 0.10         slave, 0x15, N, <the request's N bytes>, CRC
+            //   Carel IU 0.11+, K2 OU 1.2+  slave, 0x15, N, CRC
+            // In the first two the byte count counts the bytes that follow. In the
+            // short ack it is the request's, and nothing follows. Every shape is at
+            // least 5 bytes, so waiting for them never stalls a reply.
+            0x15 => {
+                // We need at least 5 bytes before anything can be concluded
+                let Some(head) = adu_buf
+                    .get(..SHORT_FILE_RECORD_ACK_LEN)
+                    .and_then(|head| <[u8; SHORT_FILE_RECORD_ACK_LEN]>::try_from(head).ok())
+                else {
+                    return Ok(None);
+                };
+                if is_short_file_record_ack(head) {
+                    // Bytes 3 and 4 are a valid CRC over bytes 0 to 2: a short ack
+                    2
+                } else {
+                    // Not the CRC, get variable length from the bytes
+                    usize::from(head[2]) + 2
+                }
+            }
             0x16 => 7,
             0x18 => {
                 if adu_buf.len() > 3 {
@@ -190,6 +215,12 @@ fn get_response_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
     } else {
         Ok(None)
     }
+}
+
+fn is_short_file_record_ack(
+    [slave, fn_code, byte_count, crc_first, crc_second]: [u8; SHORT_FILE_RECORD_ACK_LEN],
+) -> bool {
+    calc_crc(&[slave, fn_code, byte_count]) == u16::from_be_bytes([crc_first, crc_second])
 }
 
 fn calc_crc(data: &[u8]) -> u16 {
@@ -673,6 +704,70 @@ mod tests {
                 assert_eq!(data, vec![0x8902, 0x42C7]);
             } else {
                 panic!("unexpected response")
+            }
+        }
+
+        /// `adu` followed by its CRC.
+        fn with_crc(adu: &[u8]) -> BytesMut {
+            let mut buf = BytesMut::from(adu);
+            buf.put_u16(calc_crc(adu));
+            buf
+        }
+
+        /// A write of one 2-byte record to file 5000, record 0, as the
+        /// request's data: byte count, then the sub-request.
+        const FILE_RECORD_WRITE: [u8; 10] =
+            [0x09, 0x06, 0x13, 0x88, 0x00, 0x00, 0x00, 0x01, 0xAB, 0xCD];
+
+        /// Decodes `reply` from slave 1 to a file record write, expecting a
+        /// single frame that uses up the buffer.
+        fn decode_file_record_reply(reply: &[u8]) -> Vec<u8> {
+            let mut codec = ClientCodec::default();
+            let mut buf = with_crc(&[&[0x01, 0x15], reply].concat());
+            let ResponseAdu { hdr, pdu } = codec.decode(&mut buf).unwrap().unwrap();
+            assert!(buf.is_empty(), "{buf:X?} left over");
+            assert_eq!(hdr.slave_id, 0x01);
+            match pdu.into() {
+                Ok(Response::Custom(0x15, data)) => data.to_vec(),
+                other => panic!("unexpected response {other:?}"),
+            }
+        }
+
+        #[test]
+        fn decode_file_record_write_echo() {
+            assert_eq!(
+                decode_file_record_reply(&FILE_RECORD_WRITE),
+                FILE_RECORD_WRITE
+            );
+        }
+
+        #[test]
+        fn decode_file_record_write_header_echo() {
+            let header = [0x07, 0x06, 0x13, 0x88, 0x00, 0x00, 0x00, 0x01];
+            assert_eq!(decode_file_record_reply(&header), header);
+        }
+
+        #[test]
+        fn decode_file_record_write_short_ack() {
+            assert_eq!(decode_file_record_reply(&[0x09]), [0x09]);
+        }
+
+        #[test]
+        fn decode_partly_received_file_record_write_short_ack() {
+            let mut codec = ClientCodec::default();
+            let mut buf = with_crc(&[0x01, 0x15, 0x09]);
+            buf.truncate(4);
+            assert!(codec.decode(&mut buf).unwrap().is_none());
+            assert_eq!(buf.len(), 4);
+        }
+
+        #[test]
+        fn no_file_record_write_echo_starts_like_a_short_ack() {
+            for slave in 0..=u8::MAX {
+                for byte_count in 0..=u8::MAX {
+                    let [crc_first, _] = calc_crc(&[slave, 0x15, byte_count]).to_be_bytes();
+                    assert_ne!(crc_first, 0x06, "slave {slave}, byte count {byte_count}");
+                }
             }
         }
 
